@@ -9,6 +9,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -18,6 +19,30 @@ from dotenv import load_dotenv
 # Adzuna US search appears to cap results_per_page at 50.
 MAX_PER_PAGE = 50
 DEFAULT_BASE_URL = "https://api.adzuna.com/v1/api"
+
+# Default mix of roles/industries so the board is not only “data scientist” results.
+DEFAULT_DIVERSE_KEYWORDS: tuple[str, ...] = (
+    "data scientist",
+    "software engineer",
+    "registered nurse",
+    "project manager",
+    "accountant",
+    "sales representative",
+    "customer service",
+    "electrician",
+    "marketing manager",
+    "financial analyst",
+    "teacher",
+    "warehouse worker",
+    "graphic designer",
+    "human resources",
+    "data analyst",
+    "product manager",
+    "cybersecurity analyst",
+    "pharmacist",
+    "mechanical engineer",
+    "administrative assistant",
+)
 
 
 def _project_root() -> Path:
@@ -115,15 +140,96 @@ def fetch_jobs(
     return collected[:limit]
 
 
+def _job_dedup_key(job: dict) -> tuple[str, object]:
+    jid = job.get("id")
+    if jid is not None:
+        return ("id", jid)
+    url = job.get("redirect_url") or ""
+    return ("url", url)
+
+
+def fetch_jobs_multi(
+    app_id: str,
+    app_key: str,
+    keywords: list[str],
+    *,
+    where: str,
+    limit_per_keyword: int,
+    max_total: int | None,
+    country: str,
+    base_url: str,
+    timeout: float,
+    pause_s: float,
+) -> list[dict]:
+    """Run one search per keyword, merge, and dedupe by Adzuna job id (or URL)."""
+    seen: set[tuple[str, object]] = set()
+    merged: list[dict] = []
+    for i, kw in enumerate(keywords):
+        if i and pause_s > 0:
+            time.sleep(pause_s)
+        batch = fetch_jobs(
+            app_id,
+            app_key,
+            keyword=kw,
+            where=where,
+            limit=limit_per_keyword,
+            country=country,
+            base_url=base_url,
+            timeout=timeout,
+        )
+        for job in batch:
+            key = _job_dedup_key(job)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(job)
+            if max_total is not None and len(merged) >= max_total:
+                return merged
+    return merged
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Fetch jobs from Adzuna and save raw outputs.")
-    p.add_argument("--keyword", default="data scientist", help="Search keywords (Adzuna `what`).")
+    p.add_argument(
+        "--diverse",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Fetch many role types and merge (default: on). Use --no-diverse for a single --keyword search.",
+    )
+    p.add_argument(
+        "--keyword",
+        default="data scientist",
+        help="Single search keywords when --no-diverse (Adzuna `what`).",
+    )
+    p.add_argument(
+        "--keywords-csv",
+        default=None,
+        metavar="STR",
+        help='Comma-separated keywords when --diverse (overrides built-in mix), e.g. "nurse,chef,plumber".',
+    )
     p.add_argument(
         "--where",
         default="California",
         help='Location string (Adzuna `where`), e.g. "California" or "remote".',
     )
-    p.add_argument("--limit", type=int, default=50, help="Max jobs to fetch (paginates past 50).")
+    p.add_argument(
+        "--limit",
+        type=int,
+        default=100,
+        help="With --diverse: max jobs per keyword. With --no-diverse: max total jobs (default: 100).",
+    )
+    p.add_argument(
+        "--max-total",
+        type=int,
+        default=2500,
+        help="Cap merged unique jobs when --diverse (default: 2500). Use 0 for no cap.",
+    )
+    p.add_argument(
+        "--pause",
+        type=float,
+        default=0.35,
+        help="Seconds to sleep between keyword requests when --diverse (default: 0.35).",
+    )
     p.add_argument("--country", default="us", help="Adzuna country code, e.g. us, gb.")
     p.add_argument(
         "--base-url",
@@ -143,25 +249,65 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     app_id, app_key = load_credentials()
+    base = args.base_url.rstrip("/")
 
-    try:
-        raw_results = fetch_jobs(
-            app_id,
-            app_key,
-            keyword=args.keyword,
-            where=args.where,
-            limit=args.limit,
-            country=args.country,
-            base_url=args.base_url.rstrip("/"),
-            timeout=args.timeout,
-        )
-    except requests.HTTPError as e:
-        status = e.response.status_code if e.response is not None else "?"
-        print(f"Adzuna API returned HTTP {status}.", file=sys.stderr)
-        sys.exit(1)
-    except requests.RequestException as e:
-        print(f"Request to Adzuna failed ({type(e).__name__}). Check network and credentials.", file=sys.stderr)
-        sys.exit(1)
+    if args.diverse:
+        if args.keywords_csv:
+            keywords = [k.strip() for k in args.keywords_csv.split(",") if k.strip()]
+            if not keywords:
+                print("No keywords after parsing --keywords-csv.", file=sys.stderr)
+                sys.exit(1)
+        else:
+            keywords = list(DEFAULT_DIVERSE_KEYWORDS)
+        max_total = None if args.max_total == 0 else args.max_total
+        try:
+            raw_results = fetch_jobs_multi(
+                app_id,
+                app_key,
+                keywords,
+                where=args.where,
+                limit_per_keyword=args.limit,
+                max_total=max_total,
+                country=args.country,
+                base_url=base,
+                timeout=args.timeout,
+                pause_s=args.pause,
+            )
+        except requests.HTTPError as e:
+            status = e.response.status_code if e.response is not None else "?"
+            print(f"Adzuna API returned HTTP {status}.", file=sys.stderr)
+            sys.exit(1)
+        except requests.RequestException as e:
+            print(
+                f"Request to Adzuna failed ({type(e).__name__}). Check network and credentials.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        kw_note = f"{len(keywords)} keyword(s), up to {args.limit} each"
+    else:
+        keywords = [args.keyword]
+        try:
+            raw_results = fetch_jobs(
+                app_id,
+                app_key,
+                keyword=args.keyword,
+                where=args.where,
+                limit=args.limit,
+                country=args.country,
+                base_url=base,
+                timeout=args.timeout,
+            )
+        except requests.HTTPError as e:
+            status = e.response.status_code if e.response is not None else "?"
+            print(f"Adzuna API returned HTTP {status}.", file=sys.stderr)
+            sys.exit(1)
+        except requests.RequestException as e:
+            print(
+                f"Request to Adzuna failed ({type(e).__name__}). Check network and credentials.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        kw_note = f"single keyword {args.keyword!r}"
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     json_path = args.out_dir / "raw_jobs.json"
@@ -174,8 +320,8 @@ def main() -> None:
     df.to_csv(csv_path, index=False)
 
     print(
-        f"Fetched {len(raw_results)} jobs → {csv_path} and {json_path} "
-        f"(keyword={args.keyword!r}, where={args.where!r}, limit={args.limit})."
+        f"Fetched {len(raw_results)} unique jobs → {csv_path} and {json_path} "
+        f"({kw_note}; where={args.where!r})."
     )
 
 
